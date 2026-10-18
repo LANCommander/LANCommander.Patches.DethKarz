@@ -1,0 +1,2 @@
+# build.sh runs under MSYS2 sh, which fails on CRLF line endings
+*.sh text eol=lf

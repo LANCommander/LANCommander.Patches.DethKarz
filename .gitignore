@@ -1,0 +1,9 @@
+# game files (copyrighted, never committed)
+/Game/
+/bin/
+# generated
+/build/
+/ghidra/*.lock*
+/ghidra/*.rep/
+/ghidra/*.gpr
+__pycache__/
