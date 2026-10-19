@@ -39,7 +39,9 @@ static const wchar_t DEFAULTS[] =
     L"Modes: true\n"
     L"HorPlusFov: true\n"
     L"ScaleHud: true\n"
-    L"CenterMenus: true\n";
+    L"CenterMenus: true\n"
+    L"MaxPlayers: 12\n"
+    L"NameLength: 18\n";
 
 /* Plugins.Dethkarz from Config.yml, for Interposer builds whose InterposerGetConfigString is unusable */
 #define MAX_KEYS 32
@@ -202,6 +204,7 @@ __declspec(dllexport) void WINAPI InterposerPluginInit(HMODULE interposer)
     }
 
     if (dk_patch_start()) {
+        dk_players_install();
         dk_net_install();
         dk_widescreen_install();
     }

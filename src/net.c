@@ -24,7 +24,7 @@
 #define NET_HOSTQUIT (*(volatile char *)(NET + 0x314))
 #define NET_TIMEOUT  (*(volatile DWORD *)(NET + 0x1864))   /* config Timeout (ms) */
 #define NET_SENDIDX  (*(volatile int *)(NET + 0x1894))     /* host: next ring index to merge */
-#define SLOT(i)      (NET + 0x318 + (i) * 0x2a8)            /* lockstep channel (DN_GetSlot) */
+#define SLOT(i)      (dk_net_channels + (i) * 0x2a8)          /* lockstep channel (DN_GetSlot) */
 #define SLOT_WRITE(i) (*(volatile int *)(SLOT(i) + 4))      /* ring write index */
 #define HOST_SLOT    (*(volatile unsigned *)0x524c38)      /* DN_g_HostSlot */
 #define NET_THIS     ((void *)(uintptr_t)NET)
@@ -56,7 +56,7 @@ static void wait_dialog_poll(void)
         unsigned slot;
         g_last_nack = now;
         if (DN_IsHost(NET_THIS)) {
-            for (slot = 0; slot < 8; slot++) {
+            for (slot = 0; slot < (unsigned)dk_max_players; slot++) {
                 if (DN_IsRemoteActiveSlot(NET_THIS, slot) && DN_SlotTimedOut(NET_THIS, slot, now)
                     && DN_SendResendNack(NET_THIS, slot) == 0) {
                     g_nacks++;
@@ -79,7 +79,7 @@ static int host_can_merge(void)
     if (SLOT_WRITE(HOST_SLOT) == NET_SENDIDX) {
         return 0;
     }
-    for (slot = 0; slot < 8; slot++) {
+    for (slot = 0; slot < (unsigned)dk_max_players; slot++) {
         if (slot != HOST_SLOT && DN_IsRemoteActiveSlot(NET_THIS, slot) && SLOT_WRITE(slot) == NET_SENDIDX) {
             return 0;
         }
@@ -137,7 +137,7 @@ static void THISCALL on_destroy_player(void *self, DWORD *msg)
     DWORD dpid = msg[2];
     if (DN_IsHost(self)) {
         unsigned slot = MP_DPIDToSlot((void *)(uintptr_t)GAME_SETUP, dpid);
-        if (slot < 8 && DN_IsRemoteActiveSlot(self, slot)) {
+        if (slot < (unsigned)dk_max_players && DN_IsRemoteActiveSlot(self, slot)) {
             dk_log("net: DirectPlay removed player %08lx (slot %u, state %d), dropping the slot", dpid, slot, NET_STATE);
             DN_DropSlot(self, slot, 0);     /* removes the DragNet player too (vt+0x70) */
             return;

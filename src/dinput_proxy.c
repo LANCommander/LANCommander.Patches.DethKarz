@@ -64,6 +64,7 @@ static void patch_init(HINSTANCE dll)
 
     if (dk_patch_start()) {
         dk_test_install();
+        dk_players_install();
         dk_net_install();
         dk_widescreen_install();
     }

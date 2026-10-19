@@ -7,6 +7,8 @@ A set of patches for the game DethKarz (Melbourne House, 1998) that are applied 
   its own, and a player who is gone for good gets dropped.
 - **Widescreen.** Adds an 856x480 Glide mode. The view is Hor+ (you see more at the sides), the HUD scales with
   the screen, and the menus stay 4:3 in the middle of the screen with black bars.
+- **More players.** Network games take up to 12 players instead of 8, and player names can be up to 18
+  characters instead of 12.
 
 It only supports the original release of `Dethkarz.exe` (built 16 Oct 1998, PE timestamp `0x362c0cfe`).
 
@@ -31,7 +33,7 @@ not both. Its settings, the same keys as below, go under `Plugins.Dethkarz` in `
 ## Settings
 
 Every option is on by default and described in [`dist/dkpatch.ini`](dist/dkpatch.ini). Set a key to `0` to turn
-that fix off.
+that fix off (`MaxPlayers=8` and `NameLength=12` give the original limits).
 
 | section | key | what it does |
 |---|---|---|
@@ -44,6 +46,8 @@ that fix off.
 | | `HorPlusFov` | Keeps the 4:3 vertical view on wide screens and widens the horizontal one |
 | | `ScaleHud` | Scales the HUD with the screen height |
 | | `CenterMenus` | Shows menus, the pause menu and dialogs at 4:3 in the middle of the screen |
+| `[Players]` | `MaxPlayers` | Players per network game, 8..12 (default 12). Everyone needs the same value |
+| | `NameLength` | Longest player name, 12..31 (default 18; longer names overlap the lobby's icons) |
 
 Tested with the Glide renderer through nGlide 2.00. The Direct3D renderer's widescreen path hasn't been tested.
 
@@ -70,7 +74,8 @@ folder).
 
 | path | contents |
 |---|---|
-| `src/` | The patch: `dkpatch.c` (exe check, settings, guarded memory writes), `net.c`, `widescreen.c`, `dinput_proxy.c`, `interposer_plugin.c`, plus a multiplayer test harness (`test.c`, `iat.c`) that does nothing unless `DK_UNIT` is set |
+| `src/` | The patch: `dkpatch.c` (exe check, settings, guarded memory writes), `net.c`, `widescreen.c`, `players.c` (+ `players_sites.h` from `tools/gen_players.py`), `dinput_proxy.c`, `interposer_plugin.c`, plus a multiplayer test harness (`test.c`, `iat.c`, `fakeddraw.c`, and `nullglide.c` for headless runs) that does nothing unless `DK_UNIT` is set |
+| `tools/` | `mp.py` drives several headless game instances for multiplayer tests; `gen_players.py`, `disasm.py`, `gh.py` |
 | `dist/` | `dkpatch.ini` and the Interposer files to ship |
 
 The game files (`Game\`, `bin\`) are not included. You need your own copy of the game.

@@ -25,11 +25,17 @@ void *dk_hook_import(const char *dll, const char *name, void *replacement);  /* 
 /* patch modules */
 void dk_net_install(void);
 void dk_widescreen_install(void);
+void dk_players_install(void);
+
+/* players.c: the player count and where the lockstep channels are (DN_g_Net+0x318 unless relocated) */
+extern int dk_max_players;
+extern uintptr_t dk_net_channels;
 
 /* test harness (tools/mp.py), only when DK_UNIT is set */
 extern int dk_unit;
 void dk_test_install(void);
 void dk_test_wrap_dinput(void *direct_input);
+void *dk_fake_ddraw(void);   /* fakeddraw.c: headless IDirectDraw */
 
 #define DK_ADDR(a) ((void *)(uintptr_t)(a))
 #endif

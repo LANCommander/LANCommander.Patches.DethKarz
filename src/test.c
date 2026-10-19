@@ -15,7 +15,15 @@
  *     drop <ms>                        network outage: for <ms>, this unit's DragNet traffic is
  *                                      discarded in both directions (DirectPlay system messages pass)
  *     slow <ms>                        sleep this long every frame (emulates a slow PC; 0 = off)
- * - Unhandled exceptions are logged as CRASH: lines.
+ * - No idle timeouts: no attract-mode demo from the title screen, no fall back to the title from a menu.
+ * - Unhandled exceptions are logged as CRASH: lines; message boxes are logged as MSGBOX: lines instead
+ *   of being shown (answered with their default button).
+ * - Headless (DK_HEADLESS=1 as well, tools/mp.py's default): nothing reaches the screen, speakers or
+ *   system settings. headless\glide2x.dll (a null Glide, src/nullglide.c) is loaded before the game's
+ *   Glide device DLL so nGlide never runs (no fullscreen switch, splash or GPU use); the game window is
+ *   never shown or activated (activation is faked), its DirectDraw is an in-memory fake (fakeddraw.c,
+ *   so the display mode is never changed); DirectSound, CD audio (MCI) and the system mixer
+ *   are refused. Screenshots then show nothing: leave a unit visible for those.
  * Log: dkpatch_unit<N>.log. */
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +34,7 @@
 #define DPERR_NOMESSAGES ((HRESULT)0x887700beL)
 
 int dk_unit;
+static int g_headless;
 static HWND g_hwnd;
 static WNDPROC g_game_wndproc;
 static char g_cmd_path[MAX_PATH + 32];
@@ -97,10 +106,17 @@ static int skip_fmv(const char *path, int a, int b, int w, int h)
 static HWND WINAPI hk_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD style, int x, int y,
                                       int w, int h, HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
 {
-    HWND hwnd = CreateWindowExA(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
+    HWND hwnd;
+    if (g_headless && !parent) {
+        style &= ~WS_VISIBLE;
+        ex = (ex | WS_EX_NOACTIVATE) & ~WS_EX_TOPMOST;
+    }
+    hwnd = CreateWindowExA(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
     if (!g_hwnd && !parent) {
-        char t[64];
         g_hwnd = hwnd;
+    }
+    if (hwnd == g_hwnd) {
+        char t[64];
         sprintf(t, "Dethkarz unit %d", dk_unit);
         SetWindowTextA(hwnd, t);
     }
@@ -110,6 +126,136 @@ static HWND WINAPI hk_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD 
 static HWND WINAPI hk_GetActiveWindow(void)
 {
     return g_hwnd;
+}
+
+/* headless: the game window stays hidden; the activation it would get on being shown is sent instead */
+static BOOL WINAPI hk_ShowWindow(HWND hwnd, int cmd)
+{
+    static int activated;
+    if (hwnd != g_hwnd) {
+        return ShowWindow(hwnd, cmd);
+    }
+    if (!activated) {
+        activated = 1;
+        SendMessageA(hwnd, WM_ACTIVATEAPP, TRUE, 0);
+        SendMessageA(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+        SendMessageA(hwnd, WM_SETFOCUS, 0, 0);
+    }
+    return FALSE;
+}
+
+static HWND WINAPI hk_SetFocus(HWND hwnd)
+{
+    (void)hwnd;
+    return g_hwnd;
+}
+
+static BOOL WINAPI hk_SetWindowPos(HWND hwnd, HWND after, int x, int y, int w, int h, UINT flags)
+{
+    if (hwnd == g_hwnd) {
+        flags = (flags | SWP_NOACTIVATE | SWP_NOZORDER) & ~SWP_SHOWWINDOW;
+    }
+    return SetWindowPos(hwnd, after, x, y, w, h, flags);
+}
+
+static int WINAPI hk_MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type)
+{
+    char line[512], *p;
+    (void)hwnd;
+    snprintf(line, sizeof line, "%s", text ? text : "");
+    for (p = line; *p; p++) {
+        if (*p == '\n' || *p == '\r') {
+            *p = ' ';
+        }
+    }
+    dk_log("MSGBOX: [%s] %s", caption ? caption : "", line);
+    switch (type & 0xf) {
+    case MB_YESNO: case MB_YESNOCANCEL: return IDYES;
+    case MB_RETRYCANCEL: return IDCANCEL;
+    case MB_ABORTRETRYIGNORE: return IDIGNORE;
+    default: return IDOK;
+    }
+}
+
+/* the game's debug output (e.g. GetDXVersion's reasons) goes to the unit's log */
+static void WINAPI hk_OutputDebugStringA(LPCSTR text)
+{
+    char line[256];
+    size_t n;
+    lstrcpynA(line, text ? text : "", sizeof line);
+    n = strlen(line);
+    while (n && (line[n - 1] == 10 || line[n - 1] == 13)) {
+        line[--n] = 0;
+    }
+    if (n && strncmp(line, "Polys drawn", 11) != 0) {      /* the renderer's stats, every few seconds */
+        dk_log("debug: %s", line);
+    }
+}
+
+static HRESULT WINAPI hk_DirectSoundCreate(const GUID *guid, void **out, void *outer)
+{
+    (void)guid;
+    (void)outer;
+    if (out) {
+        *out = NULL;
+    }
+    return (HRESULT)0x88780078L;       /* DSERR_NODRIVER: no sound card */
+}
+
+static DWORD WINAPI hk_mciSendCommandA(UINT id, UINT msg, DWORD_PTR flags, DWORD_PTR params)
+{
+    (void)id; (void)msg; (void)flags; (void)params;
+    return 276;                         /* MCIERR_DEVICE_NOT_READY: no CD audio */
+}
+
+static UINT WINAPI hk_mixerSetControlDetails(void *mixer, void *details, DWORD flags)
+{
+    (void)mixer; (void)details; (void)flags;
+    return 0;                           /* leave the system volume alone */
+}
+
+/* the main window's DirectDraw (0x493c43, exclusive fullscreen + display mode) becomes an in-memory one;
+   the renderer list's DirectDraw probing (0x4a1bfb) stays real, it never sets a mode */
+static HRESULT (WINAPI *real_DirectDrawCreate)(GUID *, void **, void *);
+
+static HRESULT WINAPI hk_DirectDrawCreate(GUID *guid, void **out, void *outer)
+{
+    if (__builtin_return_address(0) == (void *)0x493c48) {
+        *out = dk_fake_ddraw();
+        return 0;
+    }
+    return real_DirectDrawCreate(guid, out, outer);
+}
+
+/* GetDXVersion (0x4c4010) creates a real primary surface, which fails while another program holds the
+   display (and then the game warns "requires DirectX 6"): headless units report DirectX 7 on NT */
+static void fake_dx_version(DWORD *version, DWORD *platform)
+{
+    *version = 0x700;
+    *platform = 2;
+}
+
+static void install_headless(const char *dir)
+{
+    char path[MAX_PATH + 32];
+    snprintf(path, sizeof path, "%sheadless\\glide2x.dll", dir);
+    if (!LoadLibraryA(path)) {
+        dk_log("test: headless: cannot load %s (%lu), nGlide will be used", path, GetLastError());
+    }
+    {
+        static const uint8_t call_dxver[] = { 0xe8, 0xde, 0x1c, 0x05, 0x00 };   /* call GetDXVersion */
+        if (dk_expect(0x47232d, call_dxver, 5)) {
+            dk_call(0x47232d, (void *)fake_dx_version);
+        }
+    }
+    real_DirectDrawCreate = dk_hook_import("DDRAW.dll", "DirectDrawCreate", hk_DirectDrawCreate);
+    dk_hook_import("USER32.dll", "ShowWindow", hk_ShowWindow);
+    dk_hook_import("USER32.dll", "SetFocus", hk_SetFocus);
+    dk_hook_import("USER32.dll", "SetWindowPos", hk_SetWindowPos);
+    dk_hook_import("DSOUND.dll", "DirectSoundCreate", hk_DirectSoundCreate);
+    dk_hook_import("_INMM.dll", "mciSendCommandA", hk_mciSendCommandA);
+    dk_hook_import("_INMM.dll", "mixerSetControlDetails", hk_mixerSetControlDetails);
+    dk_log("test: headless");
 }
 
 static HANDLE WINAPI hk_OpenMutexA(DWORD access, BOOL inherit, LPCSTR name)
@@ -135,6 +281,19 @@ static SHORT WINAPI hk_GetAsyncKeyState(int vk)
 
 static LRESULT CALLBACK test_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (!g_hwnd && !GetParent(hwnd)) {
+        g_hwnd = hwnd;      /* the game shows its window while CreateWindowExA is still running */
+    }
+    if (g_headless && hwnd == g_hwnd && msg == WM_WINDOWPOSCHANGING) {
+        WINDOWPOS *pos = (WINDOWPOS *)lp;   /* whoever shows or raises it: stays hidden and inactive */
+        if (pos->flags & SWP_SHOWWINDOW) {
+            static int logged;
+            if (!logged++) {
+                dk_log("test: headless: kept the window hidden (shown from %p)", __builtin_return_address(0));
+            }
+        }
+        pos->flags = (pos->flags & ~SWP_SHOWWINDOW) | SWP_NOACTIVATE | SWP_NOZORDER;
+    }
     switch (msg) {
     case WM_ACTIVATEAPP:
         if (!wp) {
@@ -435,6 +594,8 @@ void dk_test_install(void)
     dk_hook_import("USER32.dll", "GetActiveWindow", hk_GetActiveWindow);
     dk_hook_import("USER32.dll", "GetAsyncKeyState", hk_GetAsyncKeyState);
     dk_hook_import("USER32.dll", "RegisterClassA", hk_RegisterClassA);
+    dk_hook_import("USER32.dll", "MessageBoxA", hk_MessageBoxA);
+    dk_hook_import("KERNEL32.dll", "OutputDebugStringA", hk_OutputDebugStringA);
 
     {
         static const uint8_t send_old[] = { 0x8b, 0x81, 0x60, 0x01, 0x00, 0x00 };   /* DN_DPSend */
@@ -461,10 +622,26 @@ void dk_test_install(void)
         }
     }
 
+    {
+        /* no idle timeouts: the title screen would start attract-mode demo races (0x46ea09: sbb/inc ->
+           xor eax,eax) and a menu would fall back to the title (0x4555b0: jb -> jmp) while units wait */
+        static const uint8_t demo_old[] = { 0x1b, 0xc0, 0x40 }, demo_new[] = { 0x31, 0xc0, 0x90 };
+        static const uint8_t back_old[] = { 0x72, 0x12 }, back_new[] = { 0xeb, 0x12 };
+        dk_patch(0x46ea09, demo_old, demo_new, 3);
+        dk_patch(0x4555b0, back_old, back_new, 2);
+    }
+
     GetModuleFileNameA(NULL, dir, MAX_PATH);
     slash = strrchr(dir, '\\');
     if (slash) {
         slash[1] = '\0';
+    }
+    {
+        char v[8];
+        g_headless = GetEnvironmentVariableA("DK_HEADLESS", v, sizeof v) && v[0] != '0';
+        if (g_headless) {
+            install_headless(dir);
+        }
     }
     InitializeCriticalSection(&g_lock);
     snprintf(g_cmd_path, sizeof g_cmd_path, "%sdkcmd_unit%d.txt", dir, dk_unit);
