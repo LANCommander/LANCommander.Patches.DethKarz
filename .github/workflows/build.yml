@@ -40,9 +40,8 @@ jobs:
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
           mkdir -p out/standalone out/interposer/.interposer/Plugins
-          cp build/dinput.dll dist/dkpatch.ini README.md out/standalone/
+          cp build/dinput.dll dist/dkpatch.ini out/standalone/
           cp build/LANCommander.Interposer.Plugin.Dethkarz.dll out/interposer/.interposer/Plugins/
-          cp docs/interposer.md out/interposer/
           (cd out/standalone && zip -qr "../dkpatch-$version.zip" .)
           (cd out/interposer && zip -qr "../LANCommander.Interposer.Plugin.Dethkarz-$version.zip" .)
           echo "VERSION=$version" >> "$GITHUB_ENV"
