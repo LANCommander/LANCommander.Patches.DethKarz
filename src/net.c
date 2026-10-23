@@ -166,6 +166,121 @@ static void patch_vtable(uint32_t addr, uint32_t expect, void *fn)
     dk_patch(addr, &expect, &to, 4);
 }
 
+/* --- frame timer wrap (FixTimerWrap) ---
+   The game timer (object 0x53d310: +0 start, +8 now, both QueryPerformanceCounter values) returned
+   MulDiv(low32(now) - low32(start), 1000000, freq): the tick difference wraps every 2^32 ticks (429.5 s at
+   10 MHz), and the microsecond value it gives is compared as an unsigned absolute time by the frame limiter
+   (0x48cb00..0x48cf20; frame target at 0x806bb8). After a wrap, or a stall of more than ~5 s across one, the
+   limiter busy-waits for a target minutes away and every other player gets "Waiting on ...". The timer now
+   uses the full 64-bit counter (its microseconds still wrap after 71.6 min) and the limiter's comparisons are
+   signed differences, which survive that wrap too. */
+#define TIMER_FREQ (*(volatile uint32_t *)0x541108)
+
+static uint32_t timer_elapsed(LARGE_INTEGER *t, uint32_t scale)
+{
+    QueryPerformanceCounter(&t[1]);
+    return TIMER_FREQ ? (uint32_t)((uint64_t)(t[1].QuadPart - t[0].QuadPart) * scale / TIMER_FREQ) : 0;
+}
+
+static __attribute__((thiscall)) uint32_t timer_us(LARGE_INTEGER *t) { return timer_elapsed(t, 1000000); }
+static __attribute__((thiscall)) uint32_t timer_ms(LARGE_INTEGER *t) { return timer_elapsed(t, 1000); }
+
+static void fix_timer_wrap(void)
+{
+    static const uint8_t prologue[] = { 0x56, 0x8b, 0xf1, 0x57, 0x8d, 0x7e, 0x08, 0x57, 0xff, 0x15, 0xf8, 0xa0, 0x4e, 0x00 };
+    static const struct { uint32_t at; uint8_t len, old[6], new_[6]; } cmps[] = {
+        /* now > target + 5 s: resync.  cmp edx,eax ; jae -> sub edx,eax ; jns */
+        { 0x48cdec, 4, { 0x3b, 0xd0, 0x73, 0x19 }, { 0x2b, 0xd0, 0x79, 0x19 } },
+        /* wait while target > now (two copies of the loop).  cmp [target],eax -> sub eax,[target]; jbe/ja -> jns/js */
+        { 0x48ce47, 6, { 0x39, 0x05, 0xb8, 0x6b, 0x80, 0x00 }, { 0x2b, 0x05, 0xb8, 0x6b, 0x80, 0x00 } },
+        { 0x48ce4d, 1, { 0x76 }, { 0x79 } },
+        { 0x48ce59, 6, { 0x39, 0x05, 0xb8, 0x6b, 0x80, 0x00 }, { 0x2b, 0x05, 0xb8, 0x6b, 0x80, 0x00 } },
+        { 0x48ce5f, 1, { 0x77 }, { 0x78 } },
+        { 0x48cedf, 6, { 0x39, 0x05, 0xb8, 0x6b, 0x80, 0x00 }, { 0x2b, 0x05, 0xb8, 0x6b, 0x80, 0x00 } },
+        { 0x48cee5, 1, { 0x76 }, { 0x79 } },
+        { 0x48cef1, 6, { 0x39, 0x05, 0xb8, 0x6b, 0x80, 0x00 }, { 0x2b, 0x05, 0xb8, 0x6b, 0x80, 0x00 } },
+        { 0x48cef7, 1, { 0x77 }, { 0x78 } },
+        /* same with the target in ecx (kept): cmp ecx,eax -> sub eax,ecx */
+        { 0x48ce92, 4, { 0x3b, 0xc8, 0x76, 0x31 }, { 0x2b, 0xc1, 0x79, 0x31 } },
+        { 0x48ceb5, 4, { 0x3b, 0xc8, 0x77, 0xe3 }, { 0x2b, 0xc1, 0x78, 0xe3 } },
+        /* "frame started before the new target": cmp edi,eax ; sbb eax,eax ; neg eax -> sub edi,eax ; shr edi,31 ; xchg eax,edi */
+        { 0x48cc99, 6, { 0x3b, 0xf8, 0x1b, 0xc0, 0xf7, 0xd8 }, { 0x2b, 0xf8, 0xc1, 0xef, 0x1f, 0x97 } },
+    };
+    unsigned i;
+    if (!dk_expect(0x483410, prologue, sizeof prologue) || !dk_expect(0x483430, prologue, sizeof prologue)) {
+        dk_log("net: frame timer differs, FixTimerWrap skipped");
+        return;
+    }
+    for (i = 0; i < sizeof cmps / sizeof cmps[0]; i++) {
+        if (!dk_expect(cmps[i].at, cmps[i].old, cmps[i].len)) {
+            dk_log("net: frame limiter differs at 0x%x, FixTimerWrap skipped", cmps[i].at);
+            return;
+        }
+    }
+    for (i = 0; i < sizeof cmps / sizeof cmps[0]; i++) {
+        dk_write(cmps[i].at, cmps[i].new_, cmps[i].len);
+    }
+    dk_jmp(0x483410, (void *)timer_us);
+    dk_jmp(0x483430, (void *)timer_ms);
+    dk_log("net: frame timer is 64-bit and wrap-safe");
+}
+
+/* DragNet's tunables. DN_LoadRegistryConfig (0x440ab0, fastcall, ecx = DN_g_NetConfig, host only) read them as DWORDs
+   from HKLM\SOFTWARE\Melbourne House\DethKarZ\Network; this replacement reads the same names from [Net] instead (Retries
+   is the patch's own key, the same field). As in the original, a missing key keeps the DN_ConfigDefaults value, and
+   DN_ClampConfig (0x440990) runs only if something was read. The original stored ClientSkipThresh as (value != 0);
+   FixClientSkipThresh stores the value. */
+#define NO_KEY ((int)0x80000000)
+
+static void (__attribute__((fastcall)) *const DN_ClampConfig)(uint32_t *cfg) = (void *)0x440990;
+static int g_fix_skip_thresh;
+
+static int net_key(const char *key, int *out)
+{
+    int v = dk_ini_int("Net", key, NO_KEY);
+    if (v == NO_KEY) {
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+static void __attribute__((fastcall)) load_config(uint32_t *cfg)
+{
+    static const struct { const char *key; int off; int is_bool; } keys[] = {
+        { "UseAuto", 0x24, 1 }, { "Ratio", 0x00, 0 }, { "Lead", 0x04, 0 }, { "Timeout", 0x0c, 0 },
+        { "Retries", 0x10, 0 }, { "KeepAliveTimeOut", 0x14, 0 }, { "KeepAliveRetries", 0x18, 0 },
+        { "MinPacketSize", 0x1c, 0 }, { "UseFakeLatency", 0x26, 1 }, { "FakeLatencyMs", 0x2c, 0 },
+        { "UseBumpUpEvents", 0x25, 1 }, { "ClientWait", 0x27, 1 },
+    };
+    char *base = (char *)cfg;
+    size_t i;
+    int v, any = 0;
+    for (i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        if (!net_key(keys[i].key, &v) || (keys[i].off == 0x10 && v <= 0)) {   /* Retries 0 = the game's default */
+            continue;
+        }
+        if (keys[i].is_bool) {
+            base[keys[i].off] = v != 0;
+        } else {
+            memcpy(base + keys[i].off, &v, 4);
+        }
+        any = 1;
+    }
+    if (net_key("ClientSkipThresh", &v)) {
+        if (!g_fix_skip_thresh) {
+            v = v != 0;
+        }
+        memcpy(base + 0x28, &v, 4);
+        any = 1;
+    }
+    if (any) {
+        DN_ClampConfig(cfg);
+        dk_log("net: DragNet settings: UseAuto %d, Ratio %u, Lead %u, Timeout %u, Retries %u, ClientWait %d, ClientSkipThresh %u",
+               base[0x24], cfg[0], cfg[1], cfg[3], cfg[4], base[0x27], cfg[10]);
+    }
+}
+
 void dk_net_install(void)
 {
     int retries = dk_ini_int("Net", "Retries", 40);
@@ -177,11 +292,14 @@ void dk_net_install(void)
             dk_log("net: Retries default %d", retries);
         }
     }
-    if (dk_ini_int("Net", "FixClientSkipThresh", 1)) {
-        /* DN_LoadRegistryConfig stored ClientSkipThresh as (value != 0); store the value */
-        static const uint8_t old[] = { 0x33, 0xd2, 0x85, 0xc0, 0x0f, 0x95, 0xc2 };
-        static const uint8_t new_[] = { 0x89, 0xc2, 0x90, 0x90, 0x90, 0x90, 0x90 };
-        dk_patch(0x440d05, old, new_, 7);
+    {
+        static const uint8_t load_start[] = { 0x83, 0xec, 0x10, 0x8d, 0x44, 0x24, 0x08 };   /* DN_LoadRegistryConfig */
+        g_fix_skip_thresh = dk_ini_int("Net", "FixClientSkipThresh", 1);
+        if (dk_expect(0x440ab0, load_start, sizeof load_start)) {
+            dk_jmp(0x440ab0, (void *)load_config);
+        } else {
+            dk_log("net: DragNet config loader differs, its settings stay in the registry");
+        }
     }
     if (dk_ini_int("Net", "ResendWhileWaiting", 1)) {
         static const uint8_t lockstep[] = { 0x6a, 0x01, 0xe8, 0xb9, 0x0a, 0x00, 0x00 };  /* push 1; call DN_NetPoll */
@@ -193,6 +311,9 @@ void dk_net_install(void)
         } else {
             dk_log("net: wait dialog callbacks differ, ResendWhileWaiting skipped");
         }
+    }
+    if (dk_ini_int("Net", "FixTimerWrap", 1)) {
+        fix_timer_wrap();
     }
     if (dk_ini_int("Net", "HandlePlayerLoss", 1)) {
         patch_vtable(0x4f126c, 0x4457e0, (void *)on_destroy_player);

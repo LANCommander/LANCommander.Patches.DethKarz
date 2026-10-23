@@ -23,9 +23,11 @@
 typedef void (*InterposerLog_fn)(const wchar_t *verb, const wchar_t *message);
 typedef BOOL (*InterposerGetConfigString_fn)(const wchar_t *dot_path, wchar_t *buffer, DWORD size);
 typedef BOOL (*InterposerRegisterPluginConfig_fn)(const wchar_t *plugin_name, const wchar_t *yaml_defaults);
+typedef BOOL (*InterposerSetConfigString_fn)(const wchar_t *dot_path, const wchar_t *value);
 
 static InterposerLog_fn g_log;
 static InterposerGetConfigString_fn g_get_config;   /* NULL with Interposer builds that predate the fix */
+static InterposerSetConfigString_fn g_set_config;   /* (same) */
 
 /* Written to Config.yml only when there is no Plugins.Dethkarz section yet; a missing key falls back
    to the built-in default in the code, which is the same value. See docs/interposer.md. */
@@ -35,17 +37,51 @@ static const wchar_t DEFAULTS[] =
     L"ResendWhileWaiting: true\n"
     L"HandlePlayerLoss: true\n"
     L"DirectPlayKeepAlive: true\n"
+    L"FixTimerWrap: true\n"
     L"FixClientSkipThresh: true\n"
+    L"UseAuto: true\n"
+    L"Ratio: 1\n"
+    L"Lead: 1\n"
+    L"Timeout: 125\n"
+    L"KeepAliveTimeOut: 5000\n"
+    L"KeepAliveRetries: 6\n"
+    L"MinPacketSize: 0\n"
+    L"UseBumpUpEvents: true\n"
+    L"ClientWait: true\n"
+    L"ClientSkipThresh: 2\n"
+    L"UseFakeLatency: false\n"
+    L"FakeLatencyMs: 0\n"
     L"Modes: true\n"
     L"HorPlusFov: true\n"
     L"ScaleHud: true\n"
+    L"MinimapScale: 140\n"
     L"CenterMenus: true\n"
+    L"SkipIntro: true\n"
+    L"SkipDeviceDialog: true\n"
+    L"VehicleDrawDistance: 400\n"
+    L"MenuOptions: true\n"
+    L"MaxFps: 0\n"
+    L"ExperimentalTickRate: 0\n"
     L"MaxPlayers: 12\n"
-    L"NameLength: 18\n";
+    L"NameLength: 18\n"
+    L"UseSDL: true\n"
+    L"Deadzone: 10\n"
+    L"TriggerThrottle: true\n"
+    L"Rumble: true\n"
+    L"RumbleStrength: 100\n"
+    L"AutoSelect: true\n"
+    L"Redirect: true\n"
+    L"Folder: \"\"\n"
+    L"UseOpenGL: true\n"
+    L"Fullscreen: true\n"
+    L"MSAA: 4\n"
+    L"Supersample: 1\n"
+    L"SmoothTextures: true\n"
+    L"Anisotropy: 16\n";
 
 /* Plugins.Dethkarz from Config.yml, for Interposer builds whose InterposerGetConfigString is unusable */
-#define MAX_KEYS 32
-static struct { char key[48]; char value[64]; } g_keys[MAX_KEYS];
+#define MAX_KEYS 64
+static struct { char key[48]; char value[MAX_PATH]; } g_keys[MAX_KEYS];
 static int g_nkeys;
 
 static int indent_of(const char *line)
@@ -170,6 +206,40 @@ static int config_int(const char *section, const char *key, int def)
     return (int)n;
 }
 
+static int config_str(const char *section, const char *key, char *out, int size)
+{
+    wchar_t value[MAX_PATH];
+    (void)section;
+    if (!get_value(key, value, MAX_PATH)) {
+        return 0;
+    }
+    return WideCharToMultiByte(CP_ACP, 0, value, -1, out, size, NULL, NULL) > 1;
+}
+
+/* the in-game options (gfxmenu.c): Plugins.Dethkarz.Key in memory and in Config.yml */
+static int config_set(const char *section, const char *key, int value)
+{
+    wchar_t path[96], text[16];
+    (void)section;
+    if (!g_set_config) {
+        return 0;
+    }
+    swprintf(path, sizeof path / sizeof path[0], L"Plugins.Dethkarz.%hs", key);
+    swprintf(text, sizeof text / sizeof text[0], L"%d", value);
+    return g_set_config(path, text) != 0;
+}
+
+static int config_set_str(const char *section, const char *key, const char *value)
+{
+    wchar_t path[96], text[MAX_PATH];
+    (void)section;
+    if (!g_set_config || MultiByteToWideChar(CP_ACP, 0, value, -1, text, MAX_PATH) <= 0) {
+        return 0;
+    }
+    swprintf(path, sizeof path / sizeof path[0], L"Plugins.Dethkarz.%hs", key);
+    return g_set_config(path, text) != 0;
+}
+
 static void log_line(const char *line)
 {
     wchar_t wide[512];
@@ -187,10 +257,14 @@ __declspec(dllexport) void WINAPI InterposerPluginInit(HMODULE interposer)
         register_config(L"Dethkarz", DEFAULTS);
     }
     dk_set_backend(config_int, log_line);
+    dk_set_string_backend(config_str);
 
-    if (GetProcAddress(interposer, "InterposerSetConfigString")) {
+    g_set_config = (InterposerSetConfigString_fn)(void (*)(void))GetProcAddress(interposer, "InterposerSetConfigString");
+    if (g_set_config) {
         g_get_config = (InterposerGetConfigString_fn)(void (*)(void))GetProcAddress(interposer, "InterposerGetConfigString");
     }
+    dk_set_write_backend(config_set);
+    dk_set_string_write_backend(config_set_str);
     if (!g_get_config) {
         wchar_t path[MAX_PATH + 32], *slash;
         GetModuleFileNameW(interposer, path, MAX_PATH);
@@ -204,9 +278,7 @@ __declspec(dllexport) void WINAPI InterposerPluginInit(HMODULE interposer)
     }
 
     if (dk_patch_start()) {
-        dk_players_install();
-        dk_net_install();
-        dk_widescreen_install();
+        dk_install();
     }
 }
 

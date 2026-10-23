@@ -1,10 +1,15 @@
-/* Import address table hooks on Dethkarz.exe. */
+/* Import address table hooks (Dethkarz.exe, or a DLL it loaded). */
 #include <string.h>
 #include "dkpatch.h"
 
 void *dk_hook_import(const char *dll, const char *name, void *replacement)
 {
-    char *base = (char *)GetModuleHandleA(NULL);
+    return dk_hook_import_in(GetModuleHandleA(NULL), dll, name, replacement);
+}
+
+void *dk_hook_import_in(HMODULE module, const char *dll, const char *name, void *replacement)
+{
+    char *base = (char *)module;
     IMAGE_NT_HEADERS32 *nt = (IMAGE_NT_HEADERS32 *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
     IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     IMAGE_IMPORT_DESCRIPTOR *imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress);

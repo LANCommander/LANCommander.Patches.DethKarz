@@ -1,16 +1,17 @@
 /* More players and longer player names (docs/network_players.md).
  *
- * 1. MaxPlayers (9..12): the 8-player limit is a compile-time 8 spread over the player record
+ * 1. MaxPlayers (9..16): the 8-player limit is a compile-time 8 spread over the player record
  *    table (gGameSetup+0x5a0), the DragNet lockstep channels (DN_g_Net+0x318), the per-frame input
  *    array (0x521fd0), the human cars' state (0x511c78) and the lobby's row widgets. Each of those arrays is followed by live data,
  *    so they move to bigger arrays here and every instruction that indexes them gets its disp32
  *    rewritten (players_sites.h, generated and checked against the exe by tools/gen_players.py);
  *    the loop bounds and the DirectPlay session size become the new count. On top of that:
  *    - the roster message (0x27, one record per slot) is sent and received by replacements sized
- *      for 12 slots, and the DragNet receive pool's element (341 bytes, the 8x8 input bundle) grows;
+ *      for 16 slots, the DragNet receive pool's element (341 bytes, the 8x8 input bundle) grows,
+ *      and the in-race bundle's build buffer (msg 0x2b, 536 bytes; 677 at 16 x 8 frames) moves;
  *    - controller types 7..14 are network slots 0..7 and 15 is taken, so slots 8+ use 16+;
- *    - 4 more player colours;
- *    - the lobby lists 12 rows in the space of 8 (rows 17 px apart, chat lines 12 px apart).
+ *    - 8 more player colours;
+ *    - the lobby lists up to 16 rows in the space of 8.
  *    Every machine needs the same setting: the network version string carries the count, so a
  *    mismatched or unpatched game is refused with "Wrong game version".
  * 2. NameLength (12..31): the name fields allowed 12 characters (the record holds 95). The copies
@@ -21,12 +22,14 @@
 
 #define THISCALL __attribute__((thiscall))
 
-#define MAXP          12
+#define MAXP          16          /* largest MaxPlayers */
+#define DEFAULT_MAXP  12
 #define NET           0x522248u   /* DN_g_Net */
 #define GAME_SETUP    0x7045c8u   /* gGameSetup */
 #define REC_SIZE      0xac        /* player record */
 #define CHAN_SIZE     0x2a8       /* lockstep channel */
 #define ROSTER_SIZE   (2 + MAXP * REC_SIZE)
+#define BUNDLE_SIZE   1024        /* msg 0x2b worst case: 5 + MAXP * (2 + 5 * 8) = 677 */
 #define GS            ((void *)(uintptr_t)GAME_SETUP)
 
 int dk_max_players = 8;
@@ -37,6 +40,7 @@ static unsigned char g_chans[MAXP * CHAN_SIZE];
 static unsigned char g_framein[MAXP * 8];
 static unsigned char g_cars[MAXP * 0x340];     /* human car state, 0x511c78 */
 static void *g_lobby[7][MAXP];
+static unsigned char g_bundle[BUNDLE_SIZE];   /* gNet_inputBundleBuf, 0x522030 */
 
 static int (*const DN_GetLocalSlot)(void) = (void *)0x43d020;
 static void (*const DN_SetLocalSlot)(int) = (void *)0x43d030;
@@ -106,10 +110,11 @@ static void THISCALL on_roster(void *net, void *msg)
     net_vcall(net, 0x74);
 }
 
-/* --- colours: the game's 8, then orange, purple, lime, pink --- */
+/* --- colours: the game's 8, then orange, purple, lime, pink, sky blue, brown, grey, teal --- */
 
 static const float g_extra_colours[MAXP - 8][4] = {
     { 1.0f, 0.5f, 0.0f, 1.0f }, { 0.6f, 0.2f, 1.0f, 1.0f }, { 0.6f, 1.0f, 0.2f, 1.0f }, { 1.0f, 0.5f, 0.75f, 1.0f },
+    { 0.4f, 0.75f, 1.0f, 1.0f }, { 0.6f, 0.35f, 0.1f, 1.0f }, { 0.5f, 0.5f, 0.5f, 1.0f }, { 0.0f, 0.55f, 0.5f, 1.0f },
 };
 static const float *g_colours[MAXP];
 
@@ -155,7 +160,7 @@ __asm__(
     "_ps_ctrl_dispatch:\n"
     "  cmp $0x10, %eax\n"
     "  jb 2f\n"
-    "  cmp $0x14, %eax\n"
+    "  cmp $0x18, %eax\n"
     "  jae 3f\n"
     "  dec %eax\n"
     "  push $0x485441\n"
@@ -258,6 +263,8 @@ static uint32_t new_value(const struct ps_site *s, int n)
         return s->value - 0x511c78 + (uint32_t)(uintptr_t)g_cars;
     case PS_FRAMEIN:
         return s->value - 0x521fd0 + (uint32_t)(uintptr_t)g_framein;
+    case PS_BUNDLE:
+        return s->value - 0x522030 + (uint32_t)(uintptr_t)g_bundle;
     case PS_FRAMEIN_END:
         return (uint32_t)(uintptr_t)(g_framein + n * 8);
     case PS_COUNT:
@@ -283,24 +290,26 @@ static int patch_float(uint32_t at, uint32_t expect_addr, const float *value)
     return dk_patch(at, &expect_addr, &to, 4);
 }
 
-/* 12 rows where 8 were: rows 17 px apart (boxes and icons 16 px), the 5 chat lines below them 12 px apart */
-static void compact_lobby(void)
+/* up to 16 rows where 8 were: 9..12 rows 17 px apart (boxes and icons 16 px), 13..16 rows 13 px apart
+   (12 px); the 5 chat lines go below the rows, 12 px apart from y=185 (y counts up from the bottom) */
+static void compact_lobby(int n)
 {
-    static const float spacing = 17.0f, box_top = 410.0f, text_y = 396.0f, chat_spacing = 12.0f, chat_base = 185.0f;
-    static const struct { uint32_t at; uint8_t old, new_; } icons[] = {
-        { 0x458a5c, 0x16, 0x10 }, { 0x458a5e, 0x16, 0x10 },   /* cross */
-        { 0x458b2a, 0x16, 0x10 }, { 0x458b2c, 0x16, 0x10 },   /* weapon */
-        { 0x458b8b, 0x16, 0x10 }, { 0x458b8d, 0x16, 0x10 },   /* transmission */
-        { 0x458be5, 0x16, 0x10 }, { 0x458be7, 0x2c, 0x20 },   /* car */
+    static const float spacing17 = 17.0f, box_top17 = 410.0f, spacing13 = 13.0f, box_top13 = 406.0f;
+    static const float text_y = 396.0f, chat_spacing = 12.0f, chat_base = 185.0f;
+    static const struct { uint32_t at; uint8_t old, size16, size12; } icons[] = {
+        { 0x458a5c, 0x16, 0x10, 0x0c }, { 0x458a5e, 0x16, 0x10, 0x0c },   /* cross */
+        { 0x458b2a, 0x16, 0x10, 0x0c }, { 0x458b2c, 0x16, 0x10, 0x0c },   /* weapon */
+        { 0x458b8b, 0x16, 0x10, 0x0c }, { 0x458b8d, 0x16, 0x10, 0x0c },   /* transmission */
+        { 0x458be5, 0x16, 0x10, 0x0c }, { 0x458be7, 0x2c, 0x20, 0x18 },   /* car */
     };
     unsigned i;
-    patch_float(0x45893c, 0x4f1aec, &spacing);
-    patch_float(0x458954, 0x4f1af4, &box_top);
+    patch_float(0x45893c, 0x4f1aec, n > 12 ? &spacing13 : &spacing17);   /* rows' boxes: 394 - i*sp .. top - i*sp */
+    patch_float(0x458954, 0x4f1af4, n > 12 ? &box_top13 : &box_top17);
     patch_float(0x458a86, 0x4f1af8, &text_y);
     patch_float(0x458ca6, 0x4f1ae8, &chat_spacing);
     patch_float(0x458cb2, 0x4f1b00, &chat_base);
     for (i = 0; i < sizeof icons / sizeof icons[0]; i++) {
-        dk_patch(icons[i].at, &icons[i].old, &icons[i].new_, 1);
+        dk_patch(icons[i].at, &icons[i].old, n > 12 ? &icons[i].size12 : &icons[i].size16, 1);
     }
 }
 
@@ -364,13 +373,13 @@ static void install_players(int n)
     version[19] = (char)('0' + n / 10);
     version[20] = (char)('0' + n % 10);
     dk_write(0x4fe238, version, sizeof version);
-    compact_lobby();
+    compact_lobby(n);
     dk_log("players: up to %d players (%u sites)", n, (unsigned)(sizeof ps_sites / sizeof ps_sites[0]));
 }
 
 void dk_players_install(void)
 {
-    int n = dk_ini_int("Players", "MaxPlayers", MAXP);
+    int n = dk_ini_int("Players", "MaxPlayers", DEFAULT_MAXP);
     int len = dk_ini_int("Players", "NameLength", 18);
     if (len > 12) {
         install_names(len > 31 ? 31 : len);

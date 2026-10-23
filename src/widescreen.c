@@ -18,6 +18,7 @@
  *    bars are cleared with a full-screen viewport when no race is drawn underneath. The cursor
  *    lives in 640x480 space (DirectInput deltas), so it needs nothing. */
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include "dkpatch.h"
 
@@ -56,6 +57,7 @@ static int g_in_fe;      /* inside FE_Render */
 static char *g_full_vp;  /* full-screen viewport for clearing the side bars */
 static char (*g_query_caps)(void *);
 static int g_glide;   /* the loaded device DLL is the patched Glide one */
+static int g_gl_glide;   /* ... and it runs on the OpenGL Glide (any resolution) */
 
 /* --- 1. modes --- */
 
@@ -106,12 +108,44 @@ static char query_caps(void *caps)
             }
         }
     }
-    if (g_glide) {
+    if (g_glide || g_gl_glide) {
         add_mode(dst, &kept, CAPS_MAX, 856, 480, 16);
+    }
+    if (g_gl_glide) {
+        static int logged;
+        int gl[32][2], m = dk_opengl_modes(gl, 32);
+        for (i = 0; i < m; i++) {
+            add_mode(dst, &kept, CAPS_MAX, gl[i][0], gl[i][1], 16);
+        }
+        if (!logged) {
+            char list[1024];
+            int len = 0;
+            logged = 1;
+            for (i = 0; i < kept && len < (int)sizeof list - 16; i++) {
+                len += snprintf(list + len, sizeof list - len, " %dx%d", dst[i].w, dst[i].h);
+            }
+            dk_log("opengl: modes%s", list);
+        }
     }
     *(int *)caps = kept;
     if (n > CAPS_MAX) {
         dk_log("widescreen: renderer reported %d modes, kept %d", n, kept);
+    }
+    return r;
+}
+
+/* GFX_AddModeCallback (0x45e1f0, stdcall) labels each Options - Graphics mode "%dx%d %d-bit" (entries of
+   0x24 bytes at 0x535960: label[0x18], w, h, bpp). Glide modes are 16-bit, but the OpenGL Glide renders into
+   an RGBA8 framebuffer, so with it the label says 32-bit (the mode itself stays 16-bit for the game). */
+#define GFX_MODE_COUNT (*(int *)0x537dfc)
+#define GFX_MODE_LABEL(i) ((char *)0x535960 + (i) * 0x24)
+static int (__stdcall *const GFX_AddModeCallback)(int *mode) = (void *)0x45e1f0;
+
+static int __stdcall add_mode_label(int *mode)
+{
+    int r = GFX_AddModeCallback(mode);
+    if (g_gl_glide && GFX_MODE_COUNT > 0 && mode[2] == 16) {
+        snprintf(GFX_MODE_LABEL(GFX_MODE_COUNT - 1), 0x18, "%dx%d 32-bit", mode[0], mode[1]);
     }
     return r;
 }
@@ -183,6 +217,9 @@ static int render_line(float x1, float y1, float x2, float y2)
 static char resolve_exports(void)
 {
     char r = VTX_ResolveExports();
+    if (r) {
+        dk_interp_device_loaded(VTX_HMODULE);
+    }
     if (r && g_menus) {
         g_render_rect = VTX_RENDERRECT;
         g_render_tri = VTX_RENDERTRI2DC;
@@ -191,8 +228,11 @@ static char resolve_exports(void)
         VTX_RENDERTRI2DC = (void *)render_tri;
         VTX_RENDERLINE = (void *)render_line;
     }
-    if (r && g_modes) {
-        g_glide = patch_glide((char *)VTX_HMODULE);
+    if (r && dk_opengl_on) {
+        g_gl_glide = dk_opengl_device_loaded((char *)VTX_HMODULE);
+    }
+    if (r && (g_modes || g_gl_glide)) {
+        g_glide = g_gl_glide ? 0 : patch_glide((char *)VTX_HMODULE);
         g_query_caps = VTX_QUERYCAPS;
         VTX_QUERYCAPS = query_caps;
     }
@@ -324,6 +364,58 @@ static int is_call(uint32_t at, uint32_t to)
     return dk_expect(at, b, 5);
 }
 
+/* The minimap (HUD_Minimap 0x41e710, in HUD space): the track spline as lines and a triangle per car, centred
+   at (VirtW - 100, 120) on the camera and turned with it. HUD_MinimapProject (0x41e620) maps 1000 world units
+   (0x4fc97c) to 60 HUD pixels (0x4fc970), whatever the track's size; the car triangles are +-3 (the player's
+   red one, 0x4efab8/0x4efabc) and +-2 (the others, 0x4efac0/0x4efac4). MinimapScale (percent) scales both
+   by pointing those reads at scaled copies; the constants are shared with other HUD code, so they stay. */
+static float g_map_px, g_map_mark[4];
+
+static void minimap_install(void)
+{
+    static const uint32_t px_sites[] = { 0x41e6c8, 0x41e6d0 };
+    static const struct { uint32_t at, old; } marks[] = {
+        { 0x41e9b0, 0x4efab8 }, { 0x41e9f8, 0x4efab8 }, { 0x41e9cd, 0x4efabc }, { 0x41e9e6, 0x4efabc },
+        { 0x41ea52, 0x4efac0 }, { 0x41ea9a, 0x4efac0 }, { 0x41ea6f, 0x4efac4 }, { 0x41ea88, 0x4efac4 },
+    };
+    static const uint32_t mark_src[4] = { 0x4efab8, 0x4efabc, 0x4efac0, 0x4efac4 };
+    int pct = dk_ini_int("Widescreen", "MinimapScale", 140), i, j, ok;
+    float f, *p;
+    if (pct == 100) {
+        return;
+    }
+    pct = pct < 25 ? 25 : pct > 400 ? 400 : pct;
+    f = pct / 100.0f;
+    g_map_px = *(float *)0x4fc970 * f;
+    for (i = 0; i < 4; i++) {
+        g_map_mark[i] = *(float *)(uintptr_t)mark_src[i] * f;
+    }
+    ok = *(float *)0x4fc970 == 60.0f;
+    for (i = 0; i < 2; i++) {
+        static const uint8_t fmul[2] = { 0xd8, 0x0d };
+        ok = ok && dk_expect(px_sites[i], fmul, 2) && *(uint32_t *)(uintptr_t)(px_sites[i] + 2) == 0x4fc970;
+    }
+    for (i = 0; i < 8; i++) {
+        static const uint8_t fsub[2] = { 0xd8, 0x25 };
+        ok = ok && dk_expect(marks[i].at, fsub, 2) && *(uint32_t *)(uintptr_t)(marks[i].at + 2) == marks[i].old;
+    }
+    if (!ok) {
+        dk_log("widescreen: minimap code differs, MinimapScale skipped");
+        return;
+    }
+    p = &g_map_px;
+    for (i = 0; i < 2; i++) {
+        dk_write(px_sites[i] + 2, &p, 4);
+    }
+    for (i = 0; i < 8; i++) {
+        for (j = 0; mark_src[j] != marks[i].old; j++) {
+        }
+        p = &g_map_mark[j];
+        dk_write(marks[i].at + 2, &p, 4);
+    }
+    dk_log("widescreen: minimap at %d%%", pct);
+}
+
 void dk_widescreen_install(void)
 {
     static const uint8_t call_resolve[] = { 0xe8, 0x39, 0x00, 0x00, 0x00 };   /* call 0x4a0480 */
@@ -333,14 +425,35 @@ void dk_widescreen_install(void)
     static const uint8_t hud[] = { 0xd9, 0x05, 0xe0, 0x4f, 0x51, 0x00, 0xd8, 0x1d, 0xfc, 0xfa, 0x4e, 0x00 };
     static const uint32_t sub_vp[] = { 0x46568f, 0x4678a0, 0x46cef2, 0x46f684, 0x470b00 };
     static const uint8_t call_fe_render[] = { 0xe8, 0x74, 0x43, 0x04, 0x00 };   /* call FE_Render */
+    static const uint8_t intro_prologue[] = { 0x83, 0xec, 0x34 };               /* FMV_PlayBootIntro (0x472830) */
+    static const uint8_t ret_true[] = { 0xb0, 0x01, 0xc3 };                     /* mov al,1 ; ret */
     int i, ok;
     g_modes = dk_ini_int("Widescreen", "Modes", 1);
     g_menus = dk_ini_int("Widescreen", "CenterMenus", 1);
     g_fov = dk_ini_int("Widescreen", "HorPlusFov", 1);
     g_hud = dk_ini_int("Widescreen", "ScaleHud", 1);
 
-    if ((g_modes || g_menus) && dk_expect(0x4a0442, call_resolve, sizeof call_resolve)) {
+    /* The boot intro (data\fmv\dk_intro.vbc) is the one place the game changes the display mode itself: a
+       DirectDraw exclusive-fullscreen 640x480x8 switch (FMV_PlayBootIntro 0x472830 -> 0x493a80), straight to
+       the GPU, not through nGlide. Modern monitors often reject that mode ("signal out of range") at startup.
+       Everything else renders through the Vertigo device DLL (Glide/nGlide, which presents at the desktop
+       resolution). 1 = skip that intro (its window/DirectDraw/surfaces are self-contained, used nowhere else),
+       so the game goes straight to the Glide frontend. The function returns success. */
+    if (dk_ini_int("Video", "SkipIntro", 1)) {
+        if (dk_patch(0x472830, intro_prologue, ret_true, sizeof ret_true)) {
+            dk_log("video: boot intro skipped (no 640x480x8 mode change)");
+        }
+    }
+
+    if ((g_modes || g_menus || dk_opengl_on) && dk_expect(0x4a0442, call_resolve, sizeof call_resolve)) {
         dk_call(0x4a0442, resolve_exports);
+        if (dk_opengl_on) {
+            static const uint8_t push_cb[] = { 0x68, 0xf0, 0xe1, 0x45, 0x00 };   /* 0x45e1b0: push GFX_AddModeCallback */
+            uint8_t push_new[5] = { 0x68 };
+            void *cb = (void *)add_mode_label;
+            memcpy(push_new + 1, &cb, 4);
+            dk_patch(0x45e1b0, push_cb, push_new, sizeof push_new);
+        }
     } else {
         g_modes = g_menus = 0;
     }
@@ -381,5 +494,6 @@ void dk_widescreen_install(void)
             g_menus = 0;
         }
     }
+    minimap_install();
     dk_log("widescreen: Modes=%d HorPlusFov=%d ScaleHud=%d CenterMenus=%d", g_modes, g_fov, g_hud, g_menus);
 }

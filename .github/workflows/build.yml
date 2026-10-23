@@ -1,5 +1,6 @@
-# Builds on every push and pull request. A semver tag (v1.2.3, v1.2.3-rc.1) also publishes a GitHub release
-# with the standalone patch and the LANCommander Interposer plugin.
+# Builds on every push and pull request. A semver tag (v1.2.3, v1.2.3-rc.1) also queues up a draft GitHub
+# release with the three packages attached (dinput.dll, ASI, LANCommander Interposer plugin); publish it from
+# the Releases page.
 name: Build
 
 on:
@@ -25,38 +26,48 @@ jobs:
         with:
           msystem: MINGW32
           update: true
-          install: mingw-w64-i686-gcc zip
+          install: mingw-w64-i686-gcc mingw-w64-i686-SDL2 zip
 
-      - name: Check tag
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Version
         run: |
-          echo "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
-            || { echo "::error::$GITHUB_REF_NAME is not a semver tag (vMAJOR.MINOR.PATCH)"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
+              || { echo "::error::$GITHUB_REF_NAME is not a semver tag (vMAJOR.MINOR.PATCH)"; exit 1; }
+            version="$GITHUB_REF_NAME"
+          else
+            version="${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Build
-        run: sh build.sh
+        run: DK_VERSION="$VERSION" sh build.sh
 
       - name: Package
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
-          mkdir -p out/standalone out/interposer/.interposer/Plugins
-          cp build/dinput.dll dist/dkpatch.ini out/standalone/
+          mkdir -p out/dinput/dkpatch out/asi/dkpatch out/interposer/.interposer/Plugins out/interposer/dkpatch
+          cp build/dinput.dll dist/dkpatch.ini out/dinput/
+          cp build/dkpatch.asi dist/dkpatch.ini out/asi/
           cp build/LANCommander.Interposer.Plugin.Dethkarz.dll out/interposer/.interposer/Plugins/
-          (cd out/standalone && zip -qr "../dkpatch-$version.zip" .)
-          (cd out/interposer && zip -qr "../LANCommander.Interposer.Plugin.Dethkarz-$version.zip" .)
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          for d in dinput asi interposer; do
+            cp build/dkpatch/glide2x.dll out/$d/dkpatch/
+            cp LICENSE out/$d/dkpatch/LICENSE.txt
+            cp README.md out/$d/dkpatch/README.md
+          done
+          (cd out/dinput && zip -qr "../dkpatch-$VERSION-dinput.zip" .)
+          (cd out/asi && zip -qr "../dkpatch-$VERSION-asi.zip" .)
+          (cd out/interposer && zip -qr "../LANCommander.Interposer.Plugin.Dethkarz-$VERSION.zip" .)
 
       - uses: actions/upload-artifact@v4
         with:
           name: dkpatch-${{ env.VERSION }}
           path: out/*.zip
 
-      - name: Release
+      - name: Draft release
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=""
-          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          flags="--draft"
+          case "$GITHUB_REF_NAME" in *-*) flags="$flags --prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" out/*.zip --title "$GITHUB_REF_NAME" --generate-notes $flags

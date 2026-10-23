@@ -5,6 +5,7 @@
  * It reports one Voodoo2 and does nothing; frames are paced at about 60 per second in grBufferSwap so
  * a dozen instances don't each spin a core. Only the 54 functions the Vertigo DLL imports exist. */
 #include <windows.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define API __stdcall
@@ -66,16 +67,75 @@ void API grSstIdle(void) {}
 void API grSstPerfStats(void *stats) { memset(stats, 0, 5 * sizeof(unsigned)); }
 void API grSstResetPerfStats(void) {}
 
+/* Test switches (environment): DK_NULLGLIDE_FPS=n paces swaps at n per second on the precise clock (a display at n Hz
+   with VSync) instead of ~16 ms with Sleep; DK_NULLGLIDE_COST_US=n makes every drawn frame (a grBufferClear outside
+   dkgl_discard) cost n us of a simulated GPU, which a swap waits for (a GPU-bound renderer). dkgl_discard is the
+   OpenGL Glide's switch for interp.c's hidden frames. */
+static int g_fps = -1, g_cost_us;
+static double g_qpf;
+static LONGLONG g_gpu_free, g_next_swap;   /* QPC: when the simulated GPU is idle, when the next refresh is */
+static int g_discard;
+
+__declspec(dllexport) void __cdecl dkgl_discard(int on) { g_discard = on != 0; }
+
+static LONGLONG qpc(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+static void switches(void)
+{
+    char v[16];
+    LARGE_INTEGER f;
+    if (g_fps >= 0) {
+        return;
+    }
+    QueryPerformanceFrequency(&f);
+    g_qpf = (double)f.QuadPart;
+    g_fps = GetEnvironmentVariableA("DK_NULLGLIDE_FPS", v, sizeof v) ? atoi(v) : 0;
+    g_cost_us = GetEnvironmentVariableA("DK_NULLGLIDE_COST_US", v, sizeof v) ? atoi(v) : 0;
+}
+
+static void wait_until(LONGLONG t)
+{
+    while (qpc() < t) {
+        SwitchToThread();
+    }
+}
+
 void API grBufferSwap(int interval)
 {
     DWORD now = GetTickCount();
     (void)interval;
+    switches();
+    if (g_cost_us) {
+        wait_until(g_gpu_free);
+    }
+    if (g_fps > 0) {
+        LONGLONG period = (LONGLONG)(g_qpf / g_fps), t = qpc();
+        if (g_next_swap < t - period) {
+            g_next_swap = t;   /* missed refreshes: the next one */
+        }
+        g_next_swap += period;
+        wait_until(g_next_swap);
+        return;
+    }
     if (now - g_last_swap < 16) {
         Sleep(16 - (now - g_last_swap));
     }
     g_last_swap = GetTickCount();
 }
-void API grBufferClear(unsigned color, unsigned char alpha, unsigned short depth) { (void)color; (void)alpha; (void)depth; }
+void API grBufferClear(unsigned color, unsigned char alpha, unsigned short depth)
+{
+    (void)color; (void)alpha; (void)depth;
+    switches();
+    if (g_cost_us && !g_discard) {
+        LONGLONG t = qpc();
+        g_gpu_free = (g_gpu_free > t ? g_gpu_free : t) + (LONGLONG)(g_qpf * g_cost_us / 1e6);
+    }
+}
 
 FxBool API grLfbReadRegion(int buf, unsigned x, unsigned y, unsigned w, unsigned h, unsigned stride, void *dst)
 {

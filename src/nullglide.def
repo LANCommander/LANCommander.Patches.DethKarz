@@ -55,3 +55,4 @@ EXPORTS
     _guFogGenerateExp2@8 = guFogGenerateExp2@8
     _guFogGenerateExp@8 = guFogGenerateExp@8
     _guFogGenerateLinear@12 = guFogGenerateLinear@12
+    dkgl_discard

@@ -15,6 +15,8 @@
  *     drop <ms>                        network outage: for <ms>, this unit's DragNet traffic is
  *                                      discarded in both directions (DirectPlay system messages pass)
  *     slow <ms>                        sleep this long every frame (emulates a slow PC; 0 = off)
+ *     pad <control> <value> ...        virtual SDL gamepad, plugged in on first use (gamepad.c):
+ *                                      a/b/x/y/start/back/dpup/... 0|1, leftx/lefty -1..1, triggers 0..1
  * - No idle timeouts: no attract-mode demo from the title screen, no fall back to the title from a menu.
  * - Unhandled exceptions are logged as CRASH: lines; message boxes are logged as MSGBOX: lines instead
  *   of being shown (answered with their default button).
@@ -33,7 +35,6 @@
 #define QUEUE 512
 #define DPERR_NOMESSAGES ((HRESULT)0x887700beL)
 
-int dk_unit;
 static int g_headless;
 static HWND g_hwnd;
 static WNDPROC g_game_wndproc;
@@ -519,6 +520,14 @@ static void read_commands(void)
         } else if (sscanf(line, "slow %d", &hold) == 1) {
             g_slow_ms = hold;
             dk_log("test: slow %d ms per frame", hold);
+        } else if (strncmp(line, "pad ", 4) == 0) {
+            dk_gamepad_command(line + 4);
+        } else if (strncmp(line, "glshot ", 7) == 0) {   /* OpenGL renderer: write the next frame (mp.py shot) */
+            void(__cdecl *req)(const char *) = (void *)GetProcAddress(GetModuleHandleA("glide2x.dll"), "dkgl_request_screenshot");
+            line[strcspn(line, "\r\n")] = 0;
+            if (req) {
+                req(line + 7);
+            }
         } else if (strncmp(line, "ready", 5) == 0) {
             g_want_ready = 1;
         } else if (sscanf(line, "char %x", &k[0]) == 1) {

@@ -7,3 +7,11 @@
 /ghidra/*.rep/
 /ghidra/*.gpr
 __pycache__/
+# local tooling and research notes (kept out of the repository)
+/tools/
+/scripts/
+/ghidra/
+/ghidra_scripts/
+/docs/
+/CLAUDE.md
+/.mcp.json
